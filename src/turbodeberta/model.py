@@ -1,7 +1,7 @@
 import math
 import torch
 from torch import nn
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, LayerNorm, MSELoss
+from torch.nn import LayerNorm
 from transformers.models.deberta_v2 import (DisentangledSelfAttention,
                                             DebertaV2Attention,
                                             DebertaV2SelfOutput,
@@ -13,10 +13,7 @@ from transformers.models.deberta_v2 import (DisentangledSelfAttention,
                                             DebertaV2Encoder,
                                             DebertaV2PreTrainedModel,
                                             DebertaV2Model,
-                                            LegacyDebertaV2PredictionHeadTransform,
-                                            LegacyDebertaV2LMPredictionHead,
                                             LegacyDebertaV2OnlyMLMHead,
-                                            DebertaV2LMPredictionHead,
                                             DebertaV2OnlyMLMHead,
                                             DebertaV2ForMaskedLM,
                                             ContextPooler,
@@ -199,7 +196,7 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
 
 class FlashDebertaV2Attention(DebertaV2Attention):
     def __init__(self, config):
-        super().__init__()
+        nn.Module().__init__()
         self.self = FlashDisentangledSelfAttention(config)
         self.output = DebertaV2SelfOutput(config)
         self.config = config
@@ -207,14 +204,14 @@ class FlashDebertaV2Attention(DebertaV2Attention):
 
 class FlashDebertaV2Layer(DebertaV2Layer):
     def __init__(self, config):
-        super().__init__()
+        nn.Module().__init__()
         self.attention = FlashDebertaV2Attention(config)
         self.intermediate = DebertaV2Intermediate(config)
         self.output = DebertaV2Output(config)
 
 class FlashDebertaV2Encoder(DebertaV2Encoder):
     def __init__(self, config):
-        super().__init__()
+        nn.Module().__init__()
 
         self.layer = nn.ModuleList([FlashDebertaV2Layer(config) for _ in range(config.num_hidden_layers)])
         self.relative_attention = getattr(config, "relative_attention", False)
@@ -254,7 +251,7 @@ class FlashDebertaV2Model(DebertaV2Model):
 
 class FlashDebertaV2ForMaskedLM(DebertaV2ForMaskedLM):
     def __init__(self, config):
-        super().__init__(config)
+        DebertaV2PreTrainedModel().__init__(config)
         self.legacy = config.legacy
         self.deberta = FlashDebertaV2Model(config)
         if self.legacy:
@@ -267,7 +264,7 @@ class FlashDebertaV2ForMaskedLM(DebertaV2ForMaskedLM):
 
 class FlashDebertaV2ForSequenceClassification(DebertaV2ForSequenceClassification):
     def __init__(self, config):
-        super().__init__(config)
+        DebertaV2PreTrainedModel().__init__(config)
 
         num_labels = getattr(config, "num_labels", 2)
         self.num_labels = num_labels
@@ -286,7 +283,7 @@ class FlashDebertaV2ForSequenceClassification(DebertaV2ForSequenceClassification
 
 class FlashDebertaV2ForTokenClassification(DebertaV2ForTokenClassification):
     def __init__(self, config):
-        super().__init__(config)
+        DebertaV2PreTrainedModel().__init__(config)
         self.num_labels = config.num_labels
 
         self.deberta = FlashDebertaV2Model(config)
@@ -298,7 +295,7 @@ class FlashDebertaV2ForTokenClassification(DebertaV2ForTokenClassification):
 
 class FlashDebertaV2ForQuestionAnswering(DebertaV2ForQuestionAnswering):
     def __init__(self, config):
-        super().__init__(config)
+        DebertaV2PreTrainedModel().__init__(config)
         self.num_labels = config.num_labels
 
         self.deberta = FlashDebertaV2Model(config)
@@ -309,7 +306,7 @@ class FlashDebertaV2ForQuestionAnswering(DebertaV2ForQuestionAnswering):
 
 class FlashDebertaV2ForMultipleChoice(DebertaV2ForMultipleChoice):
     def __init__(self, config):
-        super().__init__(config)
+        DebertaV2PreTrainedModel().__init__(config)
 
         num_labels = getattr(config, "num_labels", 2)
         self.num_labels = num_labels
