@@ -188,22 +188,22 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
 
 class FlashDebertaV2Attention(DebertaV2Attention):
     def __init__(self, config):
-        nn.Module().__init__()
-        self.self = FlashDisentangledSelfAttention(config)
+        super().__init__(config)
+        self = FlashDisentangledSelfAttention(config)
         self.output = DebertaV2SelfOutput(config)
         self.config = config
 
 
 class FlashDebertaV2Layer(DebertaV2Layer):
     def __init__(self, config):
-        nn.Module().__init__()
+        super().__init__(config)
         self.attention = FlashDebertaV2Attention(config)
         self.intermediate = DebertaV2Intermediate(config)
         self.output = DebertaV2Output(config)
 
 class FlashDebertaV2Encoder(DebertaV2Encoder):
     def __init__(self, config):
-        nn.Module().__init__()
+        super().__init__(config)
 
         self.layer = nn.ModuleList([FlashDebertaV2Layer(config) for _ in range(config.num_hidden_layers)])
         self.relative_attention = getattr(config, "relative_attention", False)
