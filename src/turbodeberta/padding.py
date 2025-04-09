@@ -110,9 +110,10 @@ def unpad_input(hidden_states, attention_mask):
         max_seqlen_in_batch,
     )
 
-def _upad_input(query_layer, key_layer, value_layer, attention_mask, query_length, NH):
+def _upad_input(query_layer, key_layer, value_layer, pos_key, pos_query, attention_mask, query_length, NH):
     indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
     batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
+    
     key_layer = index_first_axis(
         key_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
     )
@@ -120,11 +121,21 @@ def _upad_input(query_layer, key_layer, value_layer, attention_mask, query_lengt
     value_layer = index_first_axis(
         value_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
     )
+    if pos_query is not None:
+        max_distance = pos_query.shape[-1]
+        pos_query = index_first_axis(
+            pos_query.reshape(batch_size * kv_seq_len, num_key_value_heads, max_distance), indices_k
+        )
+
     if query_length == kv_seq_len:
 
         query_layer = index_first_axis(
             query_layer.reshape(batch_size * kv_seq_len, NH, head_dim), indices_k
         )
+        if pos_key is not None:
+            pos_key = index_first_axis(
+                pos_key.reshape(batch_size * kv_seq_len, num_key_value_heads, max_distance), indices_k
+            )
         cu_seqlens_q = cu_seqlens_k
         max_seqlen_in_batch_q = max_seqlen_in_batch_k
         indices_q = indices_k
@@ -135,6 +146,8 @@ def _upad_input(query_layer, key_layer, value_layer, attention_mask, query_lengt
         )  # There is a memcpy here, that is very bad.
         indices_q = cu_seqlens_q[:-1]
         query_layer = query_layer.squeeze(1)
+        if pos_key is not None:
+            pos_key = pos_key.squeeze(1)   
     else:
         # The -q_len: slice assumes left padding.
         attention_mask = attention_mask[:, -query_length:]
@@ -144,6 +157,8 @@ def _upad_input(query_layer, key_layer, value_layer, attention_mask, query_lengt
         query_layer,
         key_layer,
         value_layer,
+        pos_key,
+        pos_query,
         indices_q,
         (cu_seqlens_q, cu_seqlens_k),
         (max_seqlen_in_batch_q, max_seqlen_in_batch_k),

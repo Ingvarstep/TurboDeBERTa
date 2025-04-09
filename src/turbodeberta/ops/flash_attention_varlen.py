@@ -7,19 +7,35 @@ import triton.language as tl
 def cdiv(a, b):
     return (a + b - 1) // b
 
+def get_mid(cu_seqlens_q, B, BLOCK_M):
+    mid_batch = []
+    mid_start = []
+    MN = 0
+    for batch in range(B):
+        q_start = cu_seqlens_q[batch]
+        q_end = cu_seqlens_q[batch+1]
+        n_batch_blocks = (q_end-q_start+BLOCK_M-1).item()//BLOCK_M
+        MN+=n_batch_blocks
+        for block in range(n_batch_blocks):
+            mid_start.append(q_start+(block)*BLOCK_M)
+            mid_batch.append(batch)
+    return (mid_batch, mid_start, MN)
+
 @triton.jit
 def _fwd_kernel_deberta_disentangled_attention(
     Q, K, V,
     K_POS, Q_POS,
     L, O,
     sm_scale,
-    stride_qz, stride_qh, stride_qm, stride_qk,
-    stride_kz, stride_kh, stride_kn, stride_kk,
-    stride_vz, stride_vh, stride_vn, stride_vk,
-    stride_oz, stride_oh, stride_om, stride_ok,
-    stride_pk0, stride_pk1, stride_pk2, stride_pk3,
-    stride_pq0, stride_pq1, stride_pq2, stride_pq3,
-    Z, H, M, N, P_SEQ,
+    cu_seqlens_q, cu_seqlens_k,
+    mid_batch, mid_start,
+    stride_qz, stride_qh, stride_qk,
+    stride_kz, stride_kh, stride_kk,
+    stride_vz, stride_vh, stride_vk,
+    stride_oz, stride_oh, stride_ok,
+    stride_pk0, stride_pk1, stride_pk2,
+    stride_pq0, stride_pq1, stride_pq2,
+    B, H, M, N,
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr, LARGER_M: tl.constexpr,
     DIVISIBLE_M: tl.constexpr, DIVISIBLE_N: tl.constexpr,
@@ -29,75 +45,78 @@ def _fwd_kernel_deberta_disentangled_attention(
 ):
     input_dtype = Q.dtype.element_ty
 
-    start_m = tl.program_id(0)
-    off_h   = tl.program_id(1)
-    off_z   = tl.program_id(2)
+    start_z = tl.program_id(0)
+
+    off_h = tl.program_id(1)
+
+    off_b = tl.load(mid_batch + start_z)
+    off_m = tl.load(mid_start + start_z)
+
+    q_start = tl.load(cu_seqlens_q + off_b)
+    q_end = tl.load(cu_seqlens_q + off_b + 1)
+
+    k_start = tl.load(cu_seqlens_k + off_b)
+    k_end = tl.load(cu_seqlens_k + off_b + 1)
+
+    lM = q_end-q_start
+    lN = k_end-k_start
+    P_SEQ = lM - lN
 
     log2e: tl.constexpr = 1.4426950408889634
 
-    Q += off_z * stride_qz + off_h * stride_qh
-    K += off_z * stride_kz + off_h * stride_kh
-    V += off_z * stride_vz + off_h * stride_vh
-    O += off_z * stride_oz + off_h * stride_oh
-    L += (off_z * H + off_h) * M  # L is of shape (B*H, M)
-
-    if HAS_C2P:
-        K_POS += off_z*stride_pk0 + off_h*stride_pk1
-    if HAS_P2C:
-        Q_POS += off_z*stride_pq0 + off_h*stride_pq1
+    L += off_m * H + off_h
 
     offs_m_base = tl.arange(0, BLOCK_M)
-    offs_m = start_m * BLOCK_M + offs_m_base
+    offs_m = offs_m_base+off_m
+    offs_m_relative = offs_m - q_start
     offs_n_base = tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_DMODEL)
+    
+    q_ptrs = Q + (offs_m[:, None] * stride_qz + off_h * stride_qh + offs_k[None, :] * stride_qk) # (BLOCK_M, BLOCK_DMODEL)
+    o_ptrs = O + (offs_m[:, None] * stride_oz + off_h * stride_oh + offs_k[None, :] * stride_ok) # (BLOCK_M, BLOCK_DMODEL)
+    l_ptrs = L + offs_m_base*H
 
-    q_ptrs = Q + (offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk)  # (BLOCK_M, BLOCK_DMODEL)
-    o_ptrs = O + (offs_m[:, None] * stride_om + offs_k[None, :] * stride_ok)  # (BLOCK_M, BLOCK_DMODEL)
-    l_ptrs = L + offs_m
-
-    mask_m = offs_m < M
-    if DIVISIBLE_M:
-        q = tl.load(q_ptrs, cache_modifier=".cg")
-    else:
-        q = tl.load(q_ptrs, mask=mask_m[:, None], cache_modifier=".cg")
+    mask_m = offs_m < q_end
+    q = tl.load(q_ptrs, mask=mask_m[:, None], cache_modifier=".cg")
 
     if BLOCK_DMODEL < 128:
         I = tl.where(offs_k[:, None] == offs_k,
-                     tl.full((BLOCK_DMODEL, BLOCK_DMODEL), 1.0, dtype=q.dtype),
-                     tl.full((BLOCK_DMODEL, BLOCK_DMODEL), 0.0, dtype=q.dtype))
-        q = tl.dot(q, I).to(q.dtype)
+                     tl.full((BLOCK_DMODEL, BLOCK_DMODEL), 1.0, dtype=input_dtype),
+                     tl.full((BLOCK_DMODEL, BLOCK_DMODEL), 0.0, dtype=input_dtype))
+        q = tl.dot(q, I).to(input_dtype)
+
+    if IS_CAUSAL:
+        hi = tl.minimum(lN, P_SEQ + (off_m + 1) * BLOCK_M)
+        if lM>lN:
+            hi = tl.maximum(0, hi)
+    else:
+        hi = lN
 
     m_i = tl.full([BLOCK_M], value=-float("inf"), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
 
-    offs_n_init = offs_n_base
-    k_ptrs = K + (offs_k[:, None] * stride_kk + offs_n_init[None, :] * stride_kn)  # (BLOCK_DMODEL, BLOCK_N)
-    v_ptrs = V + (offs_n_init[:, None] * stride_vn + offs_k[None, :] * stride_vk)  # (BLOCK_N, BLOCK_DMODEL)
+    offs_n_init = k_start+offs_n_base
+    k_ptrs = K + (offs_k[:, None] * stride_vk + offs_n_init[None, :] * stride_vz + off_h * stride_kh) # (BLOCK_DMODEL, BLOCK_N)
+    v_ptrs = V + (offs_n_init[:, None] * stride_kz + offs_k[None, :] * stride_kk + off_h * stride_vh) # (BLOCK_N, BLOCK_DMODEL)
 
-    if IS_CAUSAL:
-        hi = tl.minimum(N, P_SEQ + (start_m + 1) * BLOCK_M)
-        if LARGER_M:
-            hi = tl.maximum(0, hi)
-    else:
-        hi = N
+    if HAS_C2P:
+        k_pos_ptrs = K_POS +  (offs_m[:, None] * stride_pk0 + off_h * stride_pk1)
+    if HAS_P2C:
+        q_pos_ptrs = Q_POS +  (offs_n_init[:, None] * stride_pq0 + off_h * stride_pq1)
 
     for start_n in range(0, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         offs_n = start_n + offs_n_base
 
         mask_n = offs_n < N
-        if DIVISIBLE_N:
-            k = tl.load(k_ptrs, cache_modifier=".cg")
-            v = tl.load(v_ptrs, cache_modifier=".cg")
-        else:
-            k = tl.load(k_ptrs, mask=mask_n[None, :], cache_modifier=".cg")
-            v = tl.load(v_ptrs, mask=mask_n[:, None], cache_modifier=".cg")
+        k = tl.load(k_ptrs, mask=mask_n[None, :], cache_modifier=".cg")
+        v = tl.load(v_ptrs, mask=mask_n[:, None], cache_modifier=".cg")
 
         s = tl.zeros([BLOCK_M, BLOCK_N], dtype=input_dtype)
         s += tl.dot(q, k) * sm_scale
 
-        relative_positions = offs_m[:, None]-offs_n[None, :]  # shape: (BLOCK_M, BLOCK_N)
+        relative_positions = offs_m_relative[:, None]-offs_n[None, :]  # shape: (BLOCK_M, BLOCK_N)
 
         sign = tl.where(relative_positions > 0.0, 1.0, tl.where(relative_positions < 0.0, -1.0, 0.0))
 
@@ -117,19 +136,21 @@ def _fwd_kernel_deberta_disentangled_attention(
         if HAS_C2P:
             c2p_index = tl.minimum(tl.maximum(bucket_pos + ATT_SPAN, 0), 2 * ATT_SPAN - 1).to(tl.int32)
 
-            k_pos_ptrs = K_POS+offs_m[:, None]*stride_pk2 + c2p_index*stride_pk3
+            k_pos_ptrs_ = k_pos_ptrs + c2p_index*stride_pk2
 
-            c2p_bias = tl.load(k_pos_ptrs, mask=mask_m[:, None] & (c2p_index < 2*ATT_SPAN), other=0.0)
+            c2p_bias = tl.load(k_pos_ptrs_, mask=mask_m[:, None] & (c2p_index < 2*ATT_SPAN), other=0.0)
 
             s += c2p_bias * sm_scale
 
         if HAS_P2C:
             p2c_index = tl.minimum(tl.maximum(-bucket_pos + ATT_SPAN, 0), 2 * ATT_SPAN - 1).to(tl.int32)
 
-            q_pos_ptrs = Q_POS + (offs_n[:, None] * stride_pq2 + p2c_index * stride_pq3)
+            q_pos_ptrs_ = q_pos_ptrs + p2c_index*stride_pq2
 
-            p2c_bias = tl.load(q_pos_ptrs, mask=mask_n[:, None] & (p2c_index < 2*ATT_SPAN), other=0.0).trans(1, 0)
+            p2c_bias = tl.load(q_pos_ptrs_, mask=mask_n[:, None] & (p2c_index < 2*ATT_SPAN), other=0.0).trans(1, 0)
             s += p2c_bias * sm_scale
+
+            q_pos_ptrs += BLOCK_N * stride_pq2
 
         if not DIVISIBLE_N:
             s = tl.where(mask_n[None, :], s, float("-inf"))
@@ -145,8 +166,9 @@ def _fwd_kernel_deberta_disentangled_attention(
         l_i = l_i * alpha + tl.sum(p, 1)
         m_i = m_i_new
 
-        k_ptrs += BLOCK_N * stride_kn
-        v_ptrs += BLOCK_N * stride_vn
+        k_ptrs += BLOCK_N * stride_kz
+        v_ptrs += BLOCK_N * stride_vz
+
 
     if IS_CAUSAL and LARGER_M:
         is_empty_line = (offs_m + P_SEQ) < 0
@@ -218,7 +240,7 @@ def get_fwd_config(B, H, M, N, D, causal, disentangled=False):
     return (BLOCK_M, BLOCK_N, num_stages, num_warps)
 
 
-def flash_attn_v2_fwd_dise(q, k, v, pos_key, pos_query, causal, sm_scale, BLOCK_M, BLOCK_N,
+def flash_attn_v2_fwd_dise(q, k, v, pos_key, pos_query, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal, sm_scale, BLOCK_M, BLOCK_N,
                            position_buckets, max_relative_distance, num_warps, num_stages):
     """
     Performs the forward pass of FlashAttention with DeBERTa-style disentangled relative attention.
@@ -258,13 +280,15 @@ def flash_attn_v2_fwd_dise(q, k, v, pos_key, pos_query, causal, sm_scale, BLOCK_
         - The number of relative position buckets and max distance determines the size and behavior
           of the relative bias.
     """
-    B, H, M, D = q.shape
-    N = k.shape[2]
-    P_SEQ = N - M
-    larger_m = M > N
+    M = max_seqlen_q
+    N = max_seqlen_k
+    B = len(cu_seqlens_q)-1
+    Z, H, D = q.shape
 
-    divisible_m = (M % BLOCK_M) == 0
-    divisible_n = (N % BLOCK_N) == 0
+    mid_batch, mid_start, MN = get_mid(cu_seqlens_q, B, BLOCK_M)
+
+    mid_batch = torch.LongTensor(mid_batch).to(q.device)
+    mid_start = torch.LongTensor(mid_start).to(q.device)
 
     # Determine if each bias term is present.
     has_c2p = pos_key is not None
@@ -276,8 +300,7 @@ def flash_attn_v2_fwd_dise(q, k, v, pos_key, pos_query, causal, sm_scale, BLOCK_
     else:
         ATT_SPAN = max_relative_distance
 
-    # Setup grid: use a 3D grid (query blocks, heads, batch)
-    grid = (cdiv(M, BLOCK_M), H, B)
+    grid = (MN, H)
     o = torch.empty_like(q)
     L = torch.empty((B, H, M), device=q.device, dtype=torch.float32)
 
@@ -296,16 +319,17 @@ def flash_attn_v2_fwd_dise(q, k, v, pos_key, pos_query, causal, sm_scale, BLOCK_
             pos_key, pos_query,
             L, o,
             sm_scale,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            stride_pk0, stride_pk1, stride_pk2, stride_pk3,
-            stride_pq0, stride_pq1, stride_pq2, stride_pq3,
-            B, H, M, N, P_SEQ,
+            cu_seqlens_q, cu_seqlens_k,
+            mid_batch, mid_start,
+            q.stride(0), q.stride(1), q.stride(2),
+            k.stride(0), k.stride(1), k.stride(2),
+            v.stride(0), v.stride(1), v.stride(2),
+            o.stride(0), o.stride(1), o.stride(2),
+            stride_pk0, stride_pk1, stride_pk2,
+            stride_pq0, stride_pq1, stride_pq2,
+            B, H, M, N,
             BLOCK_M=BLOCK_M, BLOCK_DMODEL=D, BLOCK_N=BLOCK_N,
-            IS_CAUSAL=causal, LARGER_M=larger_m,
-            DIVISIBLE_M=divisible_m, DIVISIBLE_N=divisible_n,
+            IS_CAUSAL=causal,
             HAS_C2P=has_c2p, HAS_P2C=has_p2c,
             ATT_SPAN=ATT_SPAN,
             NUM_BUCKETS=position_buckets,
@@ -318,7 +342,8 @@ def flash_attn_v2_fwd_dise(q, k, v, pos_key, pos_query, causal, sm_scale, BLOCK_
 
 class FlashAttentionDisentangled(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, q_pos, k_pos, causal,
+    def forward(ctx, q, k, v, q_pos, k_pos, cu_seqlens_q, cu_seqlens_k,
+                                    max_seqlen_q, max_seqlen_k, causal,
                 sm_scale, position_buckets, max_relative_distance):
 
         Dq, Dk, Dv = q.shape[-1], k.shape[-1], v.shape[-1]
@@ -332,9 +357,10 @@ class FlashAttentionDisentangled(torch.autograd.Function):
         config = get_fwd_config(B, H, M, N, D, causal, disentangled=True)
         BLOCK_M, BLOCK_N, num_stages, num_warps = config
         
-        o, L = flash_attn_v2_fwd_dise(q, k, v, q_pos, k_pos, causal, sm_scale,
-                                      BLOCK_M, BLOCK_N, position_buckets,
-                                      max_relative_distance, num_warps, num_stages)
+        o, L = flash_attn_v2_fwd_dise(q, k, v, q_pos, k_pos, cu_seqlens_q, cu_seqlens_k,
+                                            max_seqlen_q, max_seqlen_k, causal, sm_scale,
+                                            BLOCK_M, BLOCK_N, position_buckets,
+                                            max_relative_distance, num_warps, num_stages)
         return o
 
     @staticmethod
@@ -342,8 +368,9 @@ class FlashAttentionDisentangled(torch.autograd.Function):
         # Exclude backward capabilities by raising an error.
         raise RuntimeError("Backward pass is not implemented for FlashAttentionDisentangled")
 
-def flash_attention_with_disentangled(q, k, v, q_pos, k_pos, causal=False, sm_scale=None,
-                                      position_buckets=0, max_relative_distance=0):
+def flash_attention_with_disentangled_varlen(q, k, v, q_pos, k_pos, cu_seqlens_q, cu_seqlens_k,
+                                        max_seqlen_q, max_seqlen_k, causal=False, sm_scale=None,
+                                        position_buckets=0, max_relative_distance=0):
     """
     An implementation of FlashAttention v2 with DeBERTa-style disentangled relative attention.
     This version does not support backward propagation.
@@ -365,5 +392,7 @@ def flash_attention_with_disentangled(q, k, v, q_pos, k_pos, causal=False, sm_sc
     Note:
         The backward pass is not implemented, so this function only supports forward propagation.
     """
-    return FlashAttentionDisentangled.apply(q, k, v, q_pos, k_pos, causal, sm_scale,
+    return FlashAttentionDisentangled.apply(q, k, v, q_pos, k_pos, cu_seqlens_q, cu_seqlens_k,
+                                            max_seqlen_q, max_seqlen_k, causal, sm_scale,
                                             position_buckets, max_relative_distance)
+s
