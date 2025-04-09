@@ -305,13 +305,13 @@ def flash_attn_v2_fwd_dise(q, k, v, pos_key, pos_query, cu_seqlens_q, cu_seqlens
     L = torch.empty((B, H, M), device=q.device, dtype=torch.float32)
 
     if has_c2p:
-        stride_pk0, stride_pk1, stride_pk2, stride_pk3 = pos_key.stride()
+        stride_pk0, stride_pk1, stride_pk2 = pos_key.stride()
     else:
-        stride_pk0 = stride_pk1 = stride_pk2 = stride_pk3 = 0
+        stride_pk0 = stride_pk1 = stride_pk2 = 0
     if has_p2c:
-        stride_pq0, stride_pq1, stride_pq2, stride_pq3 = pos_query.stride()
+        stride_pq0, stride_pq1, stride_pq2 = pos_query.stride()
     else:
-        stride_pq0 = stride_pq1 = stride_pq2 = stride_pq3 = 0
+        stride_pq0 = stride_pq1 = stride_pq2 = 0
 
     with torch.cuda.device(q.device.index):
         _fwd_kernel_deberta_disentangled_attention[grid](

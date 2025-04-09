@@ -1,7 +1,29 @@
 import math
 import torch
+from torch import nn
+from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, LayerNorm, MSELoss
 from transformers.models.deberta_v2 import (DisentangledSelfAttention,
                                             DebertaV2Attention,
+                                            DebertaV2SelfOutput,
+                                            DebertaV2Intermediate,
+                                            DebertaV2Output,
+                                            DebertaV2Layer,
+                                            ConvLayer,
+                                            DebertaV2Embeddings,
+                                            DebertaV2Encoder,
+                                            DebertaV2PreTrainedModel,
+                                            DebertaV2Model,
+                                            LegacyDebertaV2PredictionHeadTransform,
+                                            LegacyDebertaV2LMPredictionHead,
+                                            LegacyDebertaV2OnlyMLMHead,
+                                            DebertaV2LMPredictionHead,
+                                            DebertaV2OnlyMLMHead,
+                                            DebertaV2ForMaskedLM,
+                                            ContextPooler,
+                                            DebertaV2ForSequenceClassification,
+                                            DebertaV2ForTokenClassification,
+                                            DebertaV2ForQuestionAnswering,
+                                            DebertaV2ForMultipleChoice
                                             )
 
 from .padding import _upad_input, pad_input
@@ -173,3 +195,132 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
 
         out = out.view(B, self.num_attention_heads, L, self.head_dim).transpose(1, 2).reshape(B, L, self.all_head_size)
         return out
+
+
+class FlashDebertaV2Attention(DebertaV2Attention):
+    def __init__(self, config):
+        super().__init__()
+        self.self = FlashDisentangledSelfAttention(config)
+        self.output = DebertaV2SelfOutput(config)
+        self.config = config
+
+
+class FlashDebertaV2Layer(DebertaV2Layer):
+    def __init__(self, config):
+        super().__init__()
+        self.attention = FlashDebertaV2Attention(config)
+        self.intermediate = DebertaV2Intermediate(config)
+        self.output = DebertaV2Output(config)
+
+class FlashDebertaV2Encoder(DebertaV2Encoder):
+    def __init__(self, config):
+        super().__init__()
+
+        self.layer = nn.ModuleList([FlashDebertaV2Layer(config) for _ in range(config.num_hidden_layers)])
+        self.relative_attention = getattr(config, "relative_attention", False)
+
+        if self.relative_attention:
+            self.max_relative_positions = getattr(config, "max_relative_positions", -1)
+            if self.max_relative_positions < 1:
+                self.max_relative_positions = config.max_position_embeddings
+
+            self.position_buckets = getattr(config, "position_buckets", -1)
+            pos_ebd_size = self.max_relative_positions * 2
+
+            if self.position_buckets > 0:
+                pos_ebd_size = self.position_buckets * 2
+
+            self.rel_embeddings = nn.Embedding(pos_ebd_size, config.hidden_size)
+
+        self.norm_rel_ebd = [x.strip() for x in getattr(config, "norm_rel_ebd", "none").lower().split("|")]
+
+        if "layer_norm" in self.norm_rel_ebd:
+            self.LayerNorm = LayerNorm(config.hidden_size, config.layer_norm_eps, elementwise_affine=True)
+
+        self.conv = ConvLayer(config) if getattr(config, "conv_kernel_size", 0) > 0 else None
+        self.gradient_checkpointing = False
+
+class FlashDebertaV2Model(DebertaV2Model):
+    def __init__(self, config):
+        super().__init__(config)
+
+        self.embeddings = DebertaV2Embeddings(config)
+        self.encoder = FlashDebertaV2Encoder(config)
+        self.z_steps = 0
+        self.config = config
+        # Initialize weights and apply final processing
+        self.post_init()
+
+
+class FlashDebertaV2ForMaskedLM(DebertaV2ForMaskedLM):
+    def __init__(self, config):
+        super().__init__(config)
+        self.legacy = config.legacy
+        self.deberta = FlashDebertaV2Model(config)
+        if self.legacy:
+            self.cls = LegacyDebertaV2OnlyMLMHead(config)
+        else:
+            self._tied_weights_keys = ["lm_predictions.lm_head.weight", "deberta.embeddings.word_embeddings.weight"]
+            self.lm_predictions = DebertaV2OnlyMLMHead(config)
+        # Initialize weights and apply final processing
+        self.post_init()
+
+class FlashDebertaV2ForSequenceClassification(DebertaV2ForSequenceClassification):
+    def __init__(self, config):
+        super().__init__(config)
+
+        num_labels = getattr(config, "num_labels", 2)
+        self.num_labels = num_labels
+
+        self.deberta = FlashDebertaV2Model(config)
+        self.pooler = ContextPooler(config)
+        output_dim = self.pooler.output_dim
+
+        self.classifier = nn.Linear(output_dim, num_labels)
+        drop_out = getattr(config, "cls_dropout", None)
+        drop_out = self.config.hidden_dropout_prob if drop_out is None else drop_out
+        self.dropout = nn.Dropout(drop_out)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+class FlashDebertaV2ForTokenClassification(DebertaV2ForTokenClassification):
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_labels = config.num_labels
+
+        self.deberta = FlashDebertaV2Model(config)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+class FlashDebertaV2ForQuestionAnswering(DebertaV2ForQuestionAnswering):
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_labels = config.num_labels
+
+        self.deberta = FlashDebertaV2Model(config)
+        self.qa_outputs = nn.Linear(config.hidden_size, config.num_labels)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+class FlashDebertaV2ForMultipleChoice(DebertaV2ForMultipleChoice):
+    def __init__(self, config):
+        super().__init__(config)
+
+        num_labels = getattr(config, "num_labels", 2)
+        self.num_labels = num_labels
+
+        self.deberta = FlashDebertaV2Model(config)
+        self.pooler = ContextPooler(config)
+        output_dim = self.pooler.output_dim
+
+        self.classifier = nn.Linear(output_dim, 1)
+        drop_out = getattr(config, "cls_dropout", None)
+        drop_out = self.config.hidden_dropout_prob if drop_out is None else drop_out
+        self.dropout = nn.Dropout(drop_out)
+
+        self.init_weights()
