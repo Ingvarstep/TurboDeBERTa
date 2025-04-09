@@ -2,7 +2,7 @@ import math
 import torch
 from torch import nn
 from torch.nn import LayerNorm
-from transformers.models.deberta_v2 import (DisentangledSelfAttention,
+from transformers.models.deberta_v2.modeling_deberta_v2 import (DisentangledSelfAttention,
                                             DebertaV2Attention,
                                             DebertaV2SelfOutput,
                                             DebertaV2Intermediate,
@@ -73,7 +73,7 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
             return x
 
         def get_heads(x, attention_heads):
-            new_x_shape = x.size()[:-2] + (attention_heads, -1)
+            new_x_shape = x.size()[:-1] + (attention_heads, -1)
             x = x.view(new_x_shape).contiguous()
             return x
 
@@ -87,7 +87,7 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
         if "p2c" in self.pos_att_type:
             scale_factor += 1
 
-        sm_scale = 1/math.sqrt(self.head_dim*scale_factor)
+        sm_scale = 1/math.sqrt(self.attention_head_size*scale_factor)
 
         if self.relative_attention:
             rel_embeddings = self.pos_dropout(rel_embeddings)
@@ -112,15 +112,6 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
             pos_query = None
         else:
             pos_key, pos_query = None, None
-
-        query_layer = transform(query_layer, self.num_attention_heads)
-        key_layer = transform(key_layer, self.num_attention_heads)
-        value_layer = transform(value_layer, self.num_attention_heads)
-
-        if "c2p" in self.pos_att_type:
-            pos_key = torch.matmul(query_layer, pos_key_layer.transpose(-1, -2))
-        if "p2c" in self.pos_att_type:
-            pos_query = torch.matmul(key_layer, pos_query_layer.transpose(-1, -2))
 
         causal = False
         if not varlen:
@@ -151,6 +142,7 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
 
             if "c2p" in self.pos_att_type:
                 # query_layer = (1, NH, L, head_dim)
+                print(query_layer.shape, pos_key_layer.shape)
                 pos_key = torch.einsum("bqhd,zhmd->bqhm", query_layer, pos_key_layer)
             if "p2c" in self.pos_att_type:
                 pos_query = torch.einsum("bqhd,zhmd->bqhm", key_layer, pos_query_layer)
@@ -190,8 +182,8 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
             )
             out =  pad_input(out_unpad, indices_q, B, L).transpose(1, 2)
 
-        out = out.view(B, self.num_attention_heads, L, self.head_dim).transpose(1, 2).reshape(B, L, self.all_head_size)
-        return out
+        out = out.view(B, self.num_attention_heads, L, self.attention_head_size).transpose(1, 2).reshape(B, L, self.all_head_size)
+        return (out, None)
 
 
 class FlashDebertaV2Attention(DebertaV2Attention):

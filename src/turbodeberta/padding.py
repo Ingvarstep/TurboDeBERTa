@@ -133,6 +133,7 @@ def _upad_input(query_layer, key_layer, value_layer, pos_key, pos_query, attenti
             query_layer.reshape(batch_size * kv_seq_len, NH, head_dim), indices_k
         )
         if pos_key is not None:
+            max_distance = pos_key.shape[-1]
             pos_key = index_first_axis(
                 pos_key.reshape(batch_size * kv_seq_len, num_key_value_heads, max_distance), indices_k
             )

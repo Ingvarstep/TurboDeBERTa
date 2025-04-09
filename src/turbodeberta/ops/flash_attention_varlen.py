@@ -35,10 +35,9 @@ def _fwd_kernel_deberta_disentangled_attention(
     stride_oz, stride_oh, stride_ok,
     stride_pk0, stride_pk1, stride_pk2,
     stride_pq0, stride_pq1, stride_pq2,
-    B, H, M, N,
+    B, H, M, N,    
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr,
-    IS_CAUSAL: tl.constexpr, LARGER_M: tl.constexpr,
-    DIVISIBLE_M: tl.constexpr, DIVISIBLE_N: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
     HAS_C2P: tl.constexpr, HAS_P2C: tl.constexpr,
     ATT_SPAN: tl.constexpr,
     NUM_BUCKETS: tl.constexpr, MAX_DISTANCE: tl.constexpr
@@ -152,8 +151,8 @@ def _fwd_kernel_deberta_disentangled_attention(
 
             q_pos_ptrs += BLOCK_N * stride_pq2
 
-        if not DIVISIBLE_N:
-            s = tl.where(mask_n[None, :], s, float("-inf"))
+        s = tl.where(mask_n[None, :], s, float("-inf"))
+
         if IS_CAUSAL:
             causal_mask = (P_SEQ + offs_m[:, None]) >= offs_n[None, :]
             s = tl.where(causal_mask, s, float("-inf"))
@@ -169,37 +168,20 @@ def _fwd_kernel_deberta_disentangled_attention(
         k_ptrs += BLOCK_N * stride_kz
         v_ptrs += BLOCK_N * stride_vz
 
-
-    if IS_CAUSAL and LARGER_M:
-        is_empty_line = (offs_m + P_SEQ) < 0
+    if IS_CAUSAL and lM>lN:
+        is_empty_line = (offs_m_relative + P_SEQ) < 0
         acc = tl.where(is_empty_line[:, None], 0.0, acc * (1.0 / l_i[:, None]))
         l = tl.where(is_empty_line, float("-inf"), m_i + tl.log(l_i))
     else:
         acc = acc * (1.0 / l_i[:, None])
-        l = m_i + tl.log(l_i)
+        l = m_i + tl.log(l_i) # log(normalizer)
 
-    if DIVISIBLE_M:
-        tl.store(l_ptrs, l, cache_modifier=".cg")
-        tl.store(o_ptrs, acc.to(q.dtype), cache_modifier=".cg")
-    else:
-        tl.store(l_ptrs, l, mask=mask_m, cache_modifier=".cg")
-        tl.store(o_ptrs, acc.to(q.dtype), mask=mask_m[:, None], cache_modifier=".cg")
+    tl.store(l_ptrs, l, mask=mask_m, cache_modifier=".cg")
+    tl.store(o_ptrs, acc.to(input_dtype), mask=mask_m[:, None], cache_modifier=".cg")
 
-def get_fwd_config(B, H, M, N, D, causal, disentangled=False):
-    """
-    Determine optimal kernel configuration parameters.
 
-    Args:
-        B, H, M, N, D: Batch, head, query length, key length, per-head dimension.
-        causal (bool): Whether causal masking is applied.
-        disentangled (bool): Whether to use the DeBERTa-style disentangled attention kernel.
-                              This flag allows for small tweaks in configuration.
-
-    Returns:
-        Tuple (BLOCK_M, BLOCK_N, num_stages, num_warps)
-    """
-    capability = torch.cuda.get_device_capability()
-    if capability == (8, 0):
+def get_fwd_config(M, D, causal):
+    if torch.cuda.get_device_capability() == (8, 0):
         if not causal:
             if D <= 64:
                 BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
@@ -208,31 +190,23 @@ def get_fwd_config(B, H, M, N, D, causal, disentangled=False):
                     BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 3, 4
                 else:
                     BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 128, 3, 8
-        else:  # causal
+        else:
             if D <= 64:
-                # When using disentangled attention, we may lower num_stages slightly.
-                if disentangled:
-                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
-                else:
-                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 4, 4
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 4, 4
             else:
                 if M <= 1024:
                     BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
                 else:
                     BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 128, 3, 8
-    elif capability == (8, 6):
+    elif torch.cuda.get_device_capability() == (8, 6):
         if not causal:
             if D <= 64:
                 BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
             else:
                 BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
-        else:  # causal
+        else: # causal
             if D <= 64:
-                # For (8,6) devices we boost BLOCK_M for disentangled relative attention.
-                if disentangled:
-                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
-                else:
-                    BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
             else:
                 BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
     else:
@@ -347,14 +321,17 @@ class FlashAttentionDisentangled(torch.autograd.Function):
                 sm_scale, position_buckets, max_relative_distance):
 
         Dq, Dk, Dv = q.shape[-1], k.shape[-1], v.shape[-1]
-        assert Dq == Dk == Dv, "Query, key, and value must have the same head dimension"
-        
-        B, H, M, D = q.shape
-        N = k.shape[2]
+
+        assert Dq == Dk == Dv
+
+        BM, H, D = q.shape
+        B = len(cu_seqlens_q)-1
+        aM = BM//B
+
         if sm_scale is None:
             sm_scale = 1. / math.sqrt(D)
-        
-        config = get_fwd_config(B, H, M, N, D, causal, disentangled=True)
+
+        config = get_fwd_config(aM, D, causal)
         BLOCK_M, BLOCK_N, num_stages, num_warps = config
         
         o, L = flash_attn_v2_fwd_dise(q, k, v, q_pos, k_pos, cu_seqlens_q, cu_seqlens_k,
@@ -395,4 +372,3 @@ def flash_attention_with_disentangled_varlen(q, k, v, q_pos, k_pos, cu_seqlens_q
     return FlashAttentionDisentangled.apply(q, k, v, q_pos, k_pos, cu_seqlens_q, cu_seqlens_k,
                                             max_seqlen_q, max_seqlen_k, causal, sm_scale,
                                             position_buckets, max_relative_distance)
-s
