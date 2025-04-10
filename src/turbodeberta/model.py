@@ -189,7 +189,7 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
 class FlashDebertaV2Attention(DebertaV2Attention):
     def __init__(self, config):
         super().__init__(config)
-        self = FlashDisentangledSelfAttention(config)
+        self.self = FlashDisentangledSelfAttention(config)
         self.output = DebertaV2SelfOutput(config)
         self.config = config
 

@@ -142,7 +142,7 @@ def _fwd_kernel_deberta_disentangled_attention(
             s += c2p_bias * sm_scale
 
         if HAS_P2C:
-            p2c_index = tl.minimum(tl.maximum(-bucket_pos + ATT_SPAN, 0), 2 * ATT_SPAN - 1).to(tl.int32)
+            p2c_index = tl.minimum(tl.maximum(-bucket_pos + ATT_SPAN, 0), 2 * ATT_SPAN - 1).to(tl.int32).trans(1, 0)
 
             q_pos_ptrs_ = q_pos_ptrs + p2c_index*stride_pq2
 
